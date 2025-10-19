@@ -10,15 +10,6 @@
 #include <unordered_map>
 #include <vector>
 
-#define REPEAT_2(X) X X
-#define REPEAT_4(X) REPEAT_2(X) REPEAT_2(X)
-#define REPEAT_8(X) REPEAT_4(X) REPEAT_4(X)
-#define REPEAT_16(X) REPEAT_8(X) REPEAT_8(X)
-#define REPEAT_32(X) REPEAT_16(X) REPEAT_16(X)
-#define REPEAT_64(X) REPEAT_32(X) REPEAT_32(X)
-#define REPEAT_128(X) REPEAT_64(X) REPEAT_64(X)
-#define REPEAT_256(X) REPEAT_128(X) REPEAT_128(X)
-
 namespace {
 
 struct identity {
@@ -50,10 +41,28 @@ uint64_t rdtscp() {
 constexpr size_t max_page_size = size_t(2) * 1024 * 1024;
 
 struct Elem {
-    volatile Elem *next = nullptr;
+    Elem *next = nullptr;
+
+    static void blackbox(Elem *elem) noexcept {
+        // mark `elem` as being read from and written to; also tell that this clobbers memory.
+        // but otherwise do nothing. this is similar to making an extern function call, but renders
+        // as 0 instruction bytes and survives LTO.
+        asm volatile("" : "+rm"(elem) : : "memory");
+    }
 };
 
 struct Test {
+    // tells the optimizer this `Elem *` is used.
+    struct Result {
+        Elem *ptr;
+
+        Result(Elem *ptr) : ptr(ptr) {}
+
+        ~Result() noexcept {
+            Elem::blackbox(ptr);
+        }
+    };
+
     Elem *buf = nullptr;
     Elem alloc_start;
     Elem start;
@@ -69,21 +78,14 @@ struct Test {
     // because of how little other code there is than any smartness on the part of the compiler. so
     // I'll keep the nagging.
     [[gnu::always_inline]]
-    void run() const {
-        volatile auto *elem = start.next;
+    Result run() const {
+        auto *elem = start.next;
 
-        do {
-            REPEAT_64(elem = elem->next;)
-        } while (elem != nullptr);
-    }
-
-    [[gnu::always_inline]]
-    void run(size_t iterations) const {
-        volatile auto *elem = start.next;
-
-        for (size_t n = 0; n < iterations; n += 256) {
-            REPEAT_256(elem = elem->next;)
+        while (elem->next != nullptr) {
+            elem = elem->next;
         }
+
+        return elem;
     }
 };
 
@@ -135,11 +137,10 @@ std::vector<size_t> generate_random_permutation(std::mt19937_64 &rng, size_t cou
 
 template<class F>
 Test generate_list(std::mt19937_64 &rng, size_t buf_size, size_t length, F callback) {
-    length = align_up(length, size_t(64));
     auto result = allocate_aligned_buf(buf_size);
     auto order = generate_random_permutation(rng, length);
-    volatile auto *start = result.start.next;
-    volatile auto *prev = &result.start;
+    auto *start = result.start.next;
+    auto *prev = &result.start;
 
     for (size_t i = 0; i < length; ++i) {
         prev->next = start + callback(order[i]);
@@ -173,33 +174,26 @@ Test generate_cache_size_test(std::mt19937_64 &rng, size_t cache_size_est) {
 
 Test generate_assoc_test(std::mt19937_64 &rng, size_t cache_size, size_t assoc_est) {
     // generate a sequence of contiguous blocks, their starts spaced `cache_size` bytes apart.
-    // go randomly over each presumed set by walking the blocks cyclically before moving onto the
-    // next. above the true size we'll start evicting cache lines at every step, which will cause
-    // cache misses and evictions when we start the next block. this should result in a dramatic
-    // spike in latency.
+    // go sequentially over each presumed set by walking the blocks cyclically before moving onto
+    // the next. above the true size we'll start evicting cache lines at every step, which will
+    // cause cache misses and evictions when we start the next block. this should result in a
+    // dramatic spike in latency.
 
     auto block_interval = cache_size / sizeof(Elem);
     auto block_words = block_interval / assoc_est;
 
     auto result = allocate_aligned_buf(cache_size * assoc_est);
     auto *start = result.start.next;
-    volatile auto *prev = &result.start;
-    volatile auto *first_elem = start;
-
-    auto order = generate_random_permutation(rng, block_interval / assoc_est);
+    auto *prev = &result.start;
 
     for (size_t word_idx = 0; word_idx < block_words; ++word_idx) {
         for (size_t block_idx = 0; block_idx < assoc_est; ++block_idx) {
-            prev->next = start + block_idx * block_interval + order[word_idx];
+            prev->next = start + block_idx * block_interval + word_idx;
             prev = prev->next;
-
-            if (word_idx == 0 && block_idx == 0) {
-                first_elem = prev;
-            }
         }
     }
 
-    prev->next = first_elem;
+    prev->next = nullptr;
     result.end.next = prev;
     result.length = block_words * assoc_est;
 
@@ -228,13 +222,13 @@ uint64_t measure(F f) {
 // returns the average runtime.
 template<class F>
 double bench(size_t iterations, F f) {
-    uint64_t total(0);
+    double total(0);
 
     for (size_t i = 0; i < iterations; ++i) {
         total += f();
     }
 
-    return double(total) / double(iterations);
+    return total / double(iterations);
 }
 
 // iterates `f` no less than `n` times until the most often produced result occurs twice as often as
@@ -270,7 +264,7 @@ struct CacheData {
 
 void run_line_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
     constexpr size_t max_line_size = 512;
-    constexpr size_t iterations = 128;
+    constexpr size_t iterations = 64;
     constexpr size_t test_runs = 5;
 
     std::cout << "Running the cache line size test with the following parameters:\n";
@@ -353,14 +347,15 @@ void run_cache_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
                         test.run();
                     }
 
-                    return measure([&]() {
+                    auto result = double(measure([&]() {
                         for (size_t i = 0; i < measurement_iterations; ++i) {
                             test.run();
                         }
-                    });
-                });
+                    }));
+                    result /= double(test.length * measurement_iterations);
 
-                avg /= double(est * measurement_iterations) / sizeof(Elem);
+                    return result;
+                });
 
                 std::cout << "Estimate " << est << " B had average runtime of " << avg
                           << " ns / load\n";
@@ -382,8 +377,8 @@ void run_cache_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
             double following_jump = avgs[i + 2].second / moving_avg;
 
             if (next_jump >= 1.2 && following_jump >= 1.2) {
-                std::cout << "\nMost likely cache size: " << avgs[i].first << " B (latency "
-                          << avgs[i].second << " ns)\n";
+                std::cout << "\nMost likely cache size: " << avgs[i].first << " B\n";
+                std::cout << "Latency: " << avgs[i].second << " ns\n";
                 cache_data.size = avgs[i].first;
                 cache_data.latency = avgs[i].second;
 
@@ -416,11 +411,17 @@ void run_associativity_test(std::mt19937_64 &rng, CacheData &cache_data) {
         for (size_t est = min_assoc; est <= max_assoc; ++est) {
             auto avg = bench(iterations, [&]() {
                 auto test = generate_assoc_test(rng, cache_data.size, est);
-                test.run(test.length * warmup_iterations);
 
-                auto result =
-                    double(measure([&]() { test.run(test.length * measurement_iterations); }));
-                result /= double(align_up(test.length * measurement_iterations, size_t(256)));
+                for (size_t i = 0; i < warmup_iterations; ++i) {
+                    test.run();
+                }
+
+                auto result = double(measure([&]() {
+                    for (size_t i = 0; i < measurement_iterations; ++i) {
+                        test.run();
+                    }
+                }));
+                result /= double(test.length * measurement_iterations);
 
                 return result;
             });
@@ -432,6 +433,7 @@ void run_associativity_test(std::mt19937_64 &rng, CacheData &cache_data) {
         for (size_t i = 0; i + 1 < avgs.size(); ++i) {
             if (avgs[i].second <= 1.2 * cache_data.latency &&
                 avgs[i + 1].second >= 1.5 * cache_data.latency) {
+
                 std::cout << "\nMost likely associativity: " << avgs[i].first << "\n";
                 cache_data.assoc = avgs[i].first;
 
@@ -460,7 +462,7 @@ int main() {
     std::cout << "\n";
 
     std::cout << "Results: " << cache_data.size << " B " << cache_data.assoc << "-way cache with "
-              << cache_data.line_size << " B lines and ~" << cache_data.latency << " ns latency\n";
+              << cache_data.line_size << " B lines\n";
 
     return 0;
 }
