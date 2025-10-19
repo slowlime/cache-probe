@@ -26,6 +26,27 @@ $ meson compile -C build
 ```
 
 The binary can then be found at `build/cache`.
+
+<details>
+
+<summary>Alternative build methods</summary>
+
+Alternatively, you can build it by running the compiler directly:
+
+- GCC:
+
+  ```
+  $ g++ -std=c++17 -O2 cache.cpp -o cache
+  ```
+
+- Clang:
+
+  ```
+  $ clang++ -std=c++17 -O2 cache.cpp -o cache
+  ```
+
+</details>
+
 It's recommended to **pin the benchmark** to a single processor, which on Linux can be done using `taskset`:
 
 ```
