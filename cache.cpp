@@ -376,7 +376,7 @@ void run_cache_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
             double next_jump = avgs[i + 1].second / moving_avg;
             double following_jump = avgs[i + 2].second / moving_avg;
 
-            if (next_jump >= 1.2 && following_jump >= 1.2) {
+            if (next_jump >= 1.15 && following_jump >= 1.35) {
                 std::cout << "\nMost likely cache size: " << avgs[i].first << " B\n";
                 std::cout << "Latency: " << avgs[i].second << " ns\n";
                 cache_data.size = avgs[i].first;
