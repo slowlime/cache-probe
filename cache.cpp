@@ -87,6 +87,21 @@ struct Test {
 
         return elem;
     }
+
+    [[gnu::always_inline]]
+    Result run_write() const {
+        auto *elem = start.next;
+        Elem *prev = nullptr;
+
+        while (elem->next != nullptr) {
+            auto *next = elem->next;
+            elem->next = prev;
+            prev = elem;
+            elem = next;
+        }
+
+        return elem;
+    }
 };
 
 template<class T>
@@ -136,25 +151,43 @@ std::vector<size_t> generate_random_permutation(std::mt19937_64 &rng, size_t cou
 }
 
 template<class F>
-Test generate_list(std::mt19937_64 &rng, size_t buf_size, size_t length, F callback) {
-    auto result = allocate_aligned_buf(buf_size);
-    auto order = generate_random_permutation(rng, length);
+Test generate_list(
+    std::mt19937_64 &rng,
+    size_t buf_size,
+    size_t length,
+    F callback,
+    size_t blocks = 1
+) {
+    auto result = allocate_aligned_buf(buf_size * blocks);
     auto *start = result.start.next;
     auto *prev = &result.start;
+    auto block_interval = buf_size / sizeof(Elem);
 
-    for (size_t i = 0; i < length; ++i) {
-        prev->next = start + callback(order[i]);
-        prev = prev->next;
+    auto block_order = generate_random_permutation(rng, blocks);
+
+    for (size_t block_idx = 0; block_idx < blocks; ++block_idx) {
+        auto order = generate_random_permutation(rng, length);
+
+        for (size_t i = 0; i < length; ++i) {
+            prev->next = start + block_order[block_idx] * block_interval + callback(order[i]);
+            prev = prev->next;
+        }
     }
 
     prev->next = nullptr;
     result.end.next = prev;
-    result.length = length;
+    result.length = length * blocks;
 
     return result;
 }
 
-Test generate_line_size_test(std::mt19937_64 &rng, size_t line_size_est, size_t length) {
+Test generate_line_size_test(
+    std::mt19937_64 &rng,
+    size_t line_size_est,
+    size_t cache_size,
+    size_t length,
+    size_t blocks
+) {
     // jump around randomly. jump targets are at a multiple of the line size estimate.
     // as long as the entire area fits the cache, at the true size each access causes a cache miss.
     // at half the true size cache misses happen half as often. after we see a large enough jump in
@@ -162,7 +195,13 @@ Test generate_line_size_test(std::mt19937_64 &rng, size_t line_size_est, size_t 
     // size.
     auto stride = line_size_est / sizeof(Elem);
 
-    return generate_list(rng, line_size_est * length, length, [&](size_t n) { return stride * n; });
+    return generate_list(
+        rng,
+        cache_size,
+        length,
+        [&](size_t n) { return stride * n; },
+        blocks
+    );
 }
 
 Test generate_cache_size_test(std::mt19937_64 &rng, size_t cache_size_est) {
@@ -202,7 +241,7 @@ Test generate_assoc_test(std::mt19937_64 &rng, size_t cache_size, size_t assoc_e
 
 // creates a huge list and walks it, filling the cache with garbage.
 void scramble(std::mt19937_64 &rng, size_t cache_size) {
-    size_t size = 4 * cache_size;
+    size_t size = 8 * cache_size;
 
     auto test = generate_list(rng, sizeof(Elem) * size, size, [](size_t n) { return n; });
     test.run();
@@ -263,14 +302,16 @@ struct CacheData {
 };
 
 void run_line_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
-    constexpr size_t max_line_size = 512;
+    constexpr size_t max_line_size = 256;
     constexpr size_t iterations = 64;
     constexpr size_t test_runs = 5;
+    constexpr size_t blocks = 1024;
 
     std::cout << "Running the cache line size test with the following parameters:\n";
     std::cout << "  - min line size: " << sizeof(Elem) << " B\n";
     std::cout << "  - max line size: " << max_line_size << " B\n";
     std::cout << "  - iterations for each estimate: " << iterations << "\n";
+    std::cout << "  - block count: " << blocks << "\n";
     std::cout << "  - test runs: at least " << test_runs << "\n";
 
     cache_data.line_size = majority(test_runs, [&](size_t iteration) {
@@ -280,19 +321,23 @@ void run_line_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
             std::vector<std::pair<size_t, double>> avgs;
 
             for (size_t est = sizeof(Elem); est <= max_line_size; est <<= 1) {
-                size_t length = cache_data.size / est;
-
                 auto avg = bench(iterations, [&]() {
-                    auto test = generate_line_size_test(rng, est, length);
+                    auto test = generate_line_size_test(
+                        rng,
+                        est,
+                        cache_data.size,
+                        cache_data.size / max_line_size / sizeof(Elem),
+                        blocks
+                    );
                     scramble(rng, cache_data.size);
+                    auto result = double(measure([&]() { test.run_write(); }));
+                    result /= double(test.length);
 
-                    return measure([&]() { test.run(); });
+                    return result;
                 });
 
-                avg /= double(length);
-
                 std::cout << "  - Estimate " << est << " B had average runtime of " << avg
-                          << " ns / load\n";
+                          << " ns / element\n";
                 avgs.emplace_back(est, avg);
             }
 
@@ -322,6 +367,7 @@ void run_cache_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
     constexpr size_t measurement_iterations = 64;
     constexpr size_t iterations = 32;
     constexpr size_t avg_window = 8;
+    constexpr size_t subdivisions = 2;
 
     std::cout << "Running the cache size test with the following parameters:\n";
     std::cout << "  - min cache size: " << min_cache_size << " B\n";
@@ -337,9 +383,9 @@ void run_cache_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
         size_t est = min_cache_size;
 
         while (est <= max_cache_size) {
-            size_t step = est / 4;
+            size_t step = est / subdivisions;
 
-            for (size_t n = 0; n < 4 && est <= max_cache_size; ++n, est += step) {
+            for (size_t n = 0; n < subdivisions && est <= max_cache_size; ++n, est += step) {
                 auto avg = bench(iterations, [&]() {
                     auto test = generate_cache_size_test(rng, est);
 
@@ -376,7 +422,7 @@ void run_cache_size_test(std::mt19937_64 &rng, CacheData &cache_data) {
             double next_jump = avgs[i + 1].second / moving_avg;
             double following_jump = avgs[i + 2].second / moving_avg;
 
-            if (next_jump >= 1.15 && following_jump >= 1.35) {
+            if (next_jump >= 1.15 && following_jump >= 1.2) {
                 std::cout << "\nMost likely cache size: " << avgs[i].first << " B\n";
                 std::cout << "Latency: " << avgs[i].second << " ns\n";
                 cache_data.size = avgs[i].first;
