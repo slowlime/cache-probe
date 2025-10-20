@@ -114,22 +114,34 @@ T align_up(T n, T alignment) {
     return alignment * div_ceil(n, alignment);
 }
 
+template<class T>
+struct AlignedBuf {
+    T *buf = nullptr;
+    T *start = nullptr;
+
+    explicit AlignedBuf(size_t size) {
+        buf = static_cast<T *>(aligned_alloc(max_page_size, size));
+
+        if (buf == nullptr) {
+            // some systems don't support `aligned_alloc`, so we do what we have to.
+
+            // twice as much to make sure at least one "page" fits entirely.
+            size = align_up(size, max_page_size) * 2;
+            buf = static_cast<Elem *>(malloc(size));
+            start = reinterpret_cast<Elem *>(
+                align_up(reinterpret_cast<uintptr_t>(buf), uintptr_t(max_page_size))
+            );
+        } else {
+            start = buf;
+        }
+    }
+};
+
 Test allocate_aligned_buf(size_t size) {
     Test result;
-    result.buf = static_cast<Elem *>(aligned_alloc(max_page_size, size));
-
-    if (result.buf == nullptr) {
-        // some systems don't support `aligned_alloc`, so we do what we have to.
-
-        // twice as much to make sure at least one "page" fits entirely.
-        size = align_up(size, max_page_size) * 2;
-        result.buf = static_cast<Elem *>(malloc(size));
-        result.alloc_start.next = reinterpret_cast<Elem *>(
-            align_up(reinterpret_cast<uintptr_t>(result.buf), uintptr_t(max_page_size))
-        );
-    } else {
-        result.alloc_start.next = result.buf;
-    }
+    AlignedBuf<Elem> alloc(size);
+    result.buf = alloc.buf;
+    result.alloc_start.next = alloc.start;
 
     assert(result.buf != nullptr);
     result.start.next = result.alloc_start.next;
