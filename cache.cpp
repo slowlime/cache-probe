@@ -448,6 +448,8 @@ struct TestRunner {
         constexpr size_t iterations = 32;
         constexpr size_t avg_window = 8;
         constexpr size_t subdivisions = 2;
+        constexpr size_t test_runs_min = 5;
+        constexpr size_t test_runs_max = 11;
 
         SUPPRESS_IF_QUIET({
             std::cout << "Running the cache size test with the following parameters:\n";
@@ -457,19 +459,118 @@ struct TestRunner {
             std::cout << "  - measurement iterations: " << measurement_iterations << "\n";
             std::cout << "  - iterations for each estimate: " << iterations << "\n";
             std::cout << "  - averaging window for boundary search: " << iterations << "\n";
-            std::cout << "\n";
+            std::cout << "  - test runs: at least " << test_runs_min << ", at most "
+                      << test_runs_max << "\n";
         });
 
-        while (true) {
-            std::vector<std::pair<size_t, double>> avgs;
-            size_t est = min_cache_size;
+        auto [cache_size, latency] =
+            majority(
+                test_runs_min,
+                test_runs_max,
+                [&](size_t iteration) {
+                    SUPPRESS_IF_QUIET(std::cout << "\nRun #" << iteration << "\n");
 
-            while (est <= max_cache_size) {
-                size_t step = est / subdivisions;
+                    while (true) {
+                        std::vector<std::pair<size_t, double>> avgs;
+                        size_t est = min_cache_size;
 
-                for (size_t n = 0; n < subdivisions && est <= max_cache_size; ++n, est += step) {
+                        while (est <= max_cache_size) {
+                            size_t step = est / subdivisions;
+
+                            for (size_t n = 0; n < subdivisions && est <= max_cache_size;
+                                 ++n, est += step) {
+                                auto avg = bench(iterations, [&]() {
+                                    auto test = generate_cache_size_test(rng, est);
+
+                                    for (size_t i = 0; i < warmup_iterations; ++i) {
+                                        test.run();
+                                    }
+
+                                    auto result = double(measure([&]() {
+                                        for (size_t i = 0; i < measurement_iterations; ++i) {
+                                            test.run();
+                                        }
+                                    }));
+                                    result /= double(test.length * measurement_iterations);
+
+                                    return result;
+                                });
+
+                                SUPPRESS_IF_QUIET(
+                                    std::cout << "  - Estimate " << est
+                                              << " B had average runtime of " << avg
+                                              << " ns / load\n"
+                                );
+                                avgs.emplace_back(est, avg);
+                            }
+                        }
+
+                        // look for an element that is followed by several huge jumps in succession.
+                        for (size_t i = avg_window; i + 2 < avgs.size(); ++i) {
+                            double moving_avg = 0;
+
+                            for (size_t j = i - avg_window; j < i; ++j) {
+                                moving_avg += avgs[j].second;
+                            }
+
+                            moving_avg /= avg_window;
+
+                            double next_jump = avgs[i + 1].second / moving_avg;
+                            double following_jump = avgs[i + 2].second / moving_avg;
+
+                            if (next_jump >= 1.15 && following_jump >= 1.2) {
+                                SUPPRESS_IF_QUIET({
+                                    std::cout
+                                        << "Most likely cache size this run: " << avgs[i].first
+                                        << " B (latency: " << avgs[i].second << " ns)\n";
+                                });
+
+                                return avgs[i];
+                            }
+                        }
+
+                        SUPPRESS_IF_QUIET(
+                            std::cout
+                            << "Could not determine the cache size, running the test again...\n\n"
+                        );
+                    }
+                },
+                [](auto pair) { return pair.first; }
+            );
+
+        cache_data.size = cache_size;
+        cache_data.latency = latency;
+    }
+
+    void run_associativity_test() {
+        constexpr size_t min_assoc = 1;
+        constexpr size_t max_assoc = 32;
+        constexpr size_t warmup_iterations = 8;
+        constexpr size_t measurement_iterations = 128;
+        constexpr size_t iterations = 64;
+        constexpr size_t test_runs_min = 5;
+        constexpr size_t test_runs_max = 11;
+
+        SUPPRESS_IF_QUIET({
+            std::cout << "Running the cache associativity test with the following parameters:\n";
+            std::cout << "  - min associativity: " << min_assoc << "\n";
+            std::cout << "  - max associativity: " << max_assoc << "\n";
+            std::cout << "  - warmup iterations: " << warmup_iterations << "\n";
+            std::cout << "  - measurement iterations: " << measurement_iterations << "\n";
+            std::cout << "  - iterations for each estimate: " << iterations << "\n";
+            std::cout << "  - test runs: at least " << test_runs_min << ", at most "
+                      << test_runs_max << "\n";
+        });
+
+        cache_data.assoc = majority(test_runs_min, test_runs_max, [&](size_t iteration) {
+            SUPPRESS_IF_QUIET(std::cout << "\nRun #" << iteration << "\n");
+
+            while (true) {
+                std::vector<std::pair<size_t, double>> avgs;
+
+                for (size_t est = min_assoc; est <= max_assoc; ++est) {
                     auto avg = bench(iterations, [&]() {
-                        auto test = generate_cache_size_test(rng, est);
+                        auto test = generate_assoc_test(rng, cache_data.size, est);
 
                         for (size_t i = 0; i < warmup_iterations; ++i) {
                             test.run();
@@ -486,107 +587,31 @@ struct TestRunner {
                     });
 
                     SUPPRESS_IF_QUIET(
-                        std::cout << "Estimate " << est << " B had average runtime of " << avg
+                        std::cout << "  - Estimate " << est << " had average runtime of " << avg
                                   << " ns / load\n"
                     );
                     avgs.emplace_back(est, avg);
                 }
-            }
 
-            // look for an element that is followed by several huge jumps in succession.
-            for (size_t i = avg_window; i + 2 < avgs.size(); ++i) {
-                double moving_avg = 0;
+                for (size_t i = 0; i + 1 < avgs.size(); ++i) {
+                    if (avgs[i].second <= 1.35 * cache_data.latency &&
+                        avgs[i + 1].second >= 1.5 * cache_data.latency) {
 
-                for (size_t j = i - avg_window; j < i; ++j) {
-                    moving_avg += avgs[j].second;
-                }
+                        SUPPRESS_IF_QUIET(
+                            std::cout << "Most likely associativity this run: " << avgs[i].first
+                                      << "\n"
+                        );
 
-                moving_avg /= avg_window;
-
-                double next_jump = avgs[i + 1].second / moving_avg;
-                double following_jump = avgs[i + 2].second / moving_avg;
-
-                if (next_jump >= 1.15 && following_jump >= 1.2) {
-                    SUPPRESS_IF_QUIET({
-                        std::cout << "\nMost likely cache size: " << avgs[i].first << " B\n";
-                        std::cout << "Latency: " << avgs[i].second << " ns\n";
-                    });
-                    cache_data.size = avgs[i].first;
-                    cache_data.latency = avgs[i].second;
-
-                    return;
-                }
-            }
-
-            SUPPRESS_IF_QUIET(
-                std::cout << "\nCould not determine the cache size, running the test again...\n\n"
-            );
-        }
-    }
-
-    void run_associativity_test() {
-        constexpr size_t min_assoc = 1;
-        constexpr size_t max_assoc = 32;
-        constexpr size_t warmup_iterations = 8;
-        constexpr size_t measurement_iterations = 128;
-        constexpr size_t iterations = 64;
-
-        SUPPRESS_IF_QUIET({
-            std::cout << "Running the cache associativity test with the following parameters:\n";
-            std::cout << "  - min associativity: " << min_assoc << "\n";
-            std::cout << "  - max associativity: " << max_assoc << "\n";
-            std::cout << "  - warmup iterations: " << warmup_iterations << "\n";
-            std::cout << "  - measurement iterations: " << measurement_iterations << "\n";
-            std::cout << "  - iterations for each estimate: " << iterations << "\n";
-            std::cout << "\n";
-        });
-
-        while (true) {
-            std::vector<std::pair<size_t, double>> avgs;
-
-            for (size_t est = min_assoc; est <= max_assoc; ++est) {
-                auto avg = bench(iterations, [&]() {
-                    auto test = generate_assoc_test(rng, cache_data.size, est);
-
-                    for (size_t i = 0; i < warmup_iterations; ++i) {
-                        test.run();
+                        return avgs[i].first;
                     }
-
-                    auto result = double(measure([&]() {
-                        for (size_t i = 0; i < measurement_iterations; ++i) {
-                            test.run();
-                        }
-                    }));
-                    result /= double(test.length * measurement_iterations);
-
-                    return result;
-                });
+                }
 
                 SUPPRESS_IF_QUIET(
-                    std::cout << "Estimate " << est << " had average runtime of " << avg
-                              << " ns / load\n"
+                    std::cout << "Could not determine the cache associativity, running the test "
+                                 "again...\n\n"
                 );
-                avgs.emplace_back(est, avg);
             }
-
-            for (size_t i = 0; i + 1 < avgs.size(); ++i) {
-                if (avgs[i].second <= 1.2 * cache_data.latency &&
-                    avgs[i + 1].second >= 1.5 * cache_data.latency) {
-
-                    SUPPRESS_IF_QUIET(
-                        std::cout << "\nMost likely associativity: " << avgs[i].first << "\n"
-                    );
-                    cache_data.assoc = avgs[i].first;
-
-                    return;
-                }
-            }
-
-            SUPPRESS_IF_QUIET(
-                std::cout
-                << "\nCould not determine the cache associativity, running the test again...\n\n"
-            );
-        }
+        });
     }
 };
 
