@@ -12,7 +12,7 @@ Due to the probabilistic nature of the experiments `cache-probe` makes a few ass
 - the L1d cache is set-associative (direct-mapped may work, fully associative likely won't)
 - the TLB is sophisticated enough not to affect the measurements significantly
 - the cache line size is a power of two
-- the cache size is $(1 + {N \over 4}) 2^k$, where $N < 4$
+- the cache size is $(1 + {N \over 2}) 2^k$, where $N < 2$
 - cache misses on the L1d cache are significantly slower than cache hits (more than twice as much)
 
 The benchmark was tested on several machines (desktop, server, laptop, smartphone) and found to work well enough across all of them.
