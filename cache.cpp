@@ -86,6 +86,7 @@ struct Test {
         blackbox(elem);
     }
 
+    /*
     [[gnu::always_inline]]
     void run_write() const {
         auto *elem = start.next;
@@ -100,6 +101,7 @@ struct Test {
 
         blackbox(elem);
     }
+    */
 };
 
 template<class T>
