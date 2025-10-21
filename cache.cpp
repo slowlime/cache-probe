@@ -335,6 +335,8 @@ struct TestRunner {
     CacheData cache_data;
     bool quiet;
 
+    TestRunner(bool quiet, std::mt19937_64 rng) : rng(rng), quiet(quiet) {}
+
     void run_line_size_test() {
         constexpr size_t max_line_size = 256;
         constexpr size_t iterations = 256;
@@ -625,10 +627,7 @@ int main(int argc, char **argv) {
     bool quiet = args.quiet;
 
     std::random_device rnd_dev;
-    TestRunner runner{
-        .rng{rnd_dev()},
-        .quiet = args.quiet,
-    };
+    TestRunner runner(args.quiet, std::mt19937_64{rnd_dev()});
 
     runner.run_cache_size_test();
     SUPPRESS_IF_QUIET(std::cout << "\n");
